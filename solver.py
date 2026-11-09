@@ -1,12 +1,12 @@
 """
-MADM Solver — minimax training with stop-gradient and evaluation
+HADM Solver — 梯度分离极小极大训练与评估
 
-Training objective (paper Eq. 21-22):
-    Phase 1 (amplify):        L1 = L_rec - k * L_series - lambda_r * L_spatial
-    Phase 2 (prior learning): L2 = L_rec + k * L_prior
+训练公式（论文 Eq. 21–22）：
+    Phase 1（放大）：  L1 = L_rec - k·L_series - λ_r·L_rel
+    Phase 2（先验学习）：L2 = L_rec + k·L_prior
 
-Anomaly score (paper Eq. 25):
-    Score(t) = Softmax(-L_series - L_prior) * ||x_hat_t - x_t||^2 * (1 + D_bar_S)
+异常评分（论文 Eq. 25）：
+    Score(t) = Softmax(-L_series - L_prior) · ||x̂_t - x_t||² · (1 + D̄_rel)
 """
 
 import os
@@ -20,28 +20,28 @@ from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from sklearn.metrics.pairwise import cosine_similarity
 
 from data_factory.data_loader import get_loader_segment
-from model.madm import MADM
+from model.hadm import HADM
 
 
 # ============================================================
-#  Utilities
+#  工具函数
 # ============================================================
 def my_kl_loss(p, q):
-    """Symmetric KL divergence: sum over last dim, mean over batch."""
+    """对称 KL 散度：先对最后一维求和，再对 batch 均值。"""
     res = p * (torch.log(p + 1e-4) - torch.log(q + 1e-4))
     return torch.mean(torch.sum(res, dim=-1), dim=1)
 
 
 def adjust_learning_rate(optimizer, epoch, lr_init, decay_interval=2):
-    """Halve the learning rate every decay_interval epochs."""
+    """每 decay_interval 个 epoch 将学习率减半。"""
     lr = lr_init * (0.5 ** ((epoch - 1) // decay_interval))
     for pg in optimizer.param_groups:
         pg['lr'] = lr
-    print(f"  lr adjusted to {lr:.2e}")
+    print(f"  学习率调整为 {lr:.2e}")
 
 
 class EarlyStopping:
-    """Early stopping with model checkpointing."""
+    """带模型保存的早停机制。"""
     def __init__(self, patience=7, verbose=True, dataset_name='', delta=0.0):
         self.patience  = patience
         self.verbose   = verbose
@@ -67,16 +67,16 @@ class EarlyStopping:
 
     def _save(self, val_loss, model, path):
         if self.verbose:
-            print(f"  val loss decreased ({self.val_loss_min:.6f} -> {val_loss:.6f}), saving model...")
+            print(f"  验证损失下降 ({self.val_loss_min:.6f} → {val_loss:.6f})，保存模型...")
         torch.save(model.state_dict(),
                    os.path.join(path, f'{self.dataset}_checkpoint.pth'))
         self.val_loss_min = val_loss
 
 
 # ============================================================
-#  MADMSolver
+#  HADMSolver
 # ============================================================
-class MADMSolver:
+class HADMSolver:
     def __init__(self, config):
         self.config = config
         self.__dict__.update(config)
@@ -84,7 +84,7 @@ class MADMSolver:
         self.device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
 
-        # ---- Data loaders ----
+        # ---- 数据加载 ----
         _loader = lambda mode: get_loader_segment(
             self.data_path, self.batch_size, self.win_size,
             step=1, mode=mode, dataset=self.dataset)
@@ -93,22 +93,22 @@ class MADMSolver:
         self.test_loader  = _loader('test')
         self.thre_loader  = _loader('thre')
 
-        # ---- Hypergraph + model ----
+        # ---- 超图 + 模型 ----
         self.hyperedge_index, self.edge_features = \
             self._build_hypergraph()
         self._build_model()
         self.criterion = nn.MSELoss()
 
     # ----------------------------------------------------------
-    #  Hypergraph construction
+    #  超图构建
     # ----------------------------------------------------------
     def _build_hypergraph(self):
-        """Build Top-K hypergraph based on cosine similarity."""
+        """基于全量训练数据的余弦相似度构建 Top-K 超图。"""
         try:
-            train_data = next(iter(self.train_loader))[0]
-            train_data = train_data.cpu().numpy().astype(np.float64)
-            sample = train_data[0]                    # [L, C]
-            cos_sim = cosine_similarity(sample.T)     # [C, C]
+            # 使用全量训练数据（所有时间步）计算传感器间余弦相似度
+            full_train = self.train_loader.dataset.train  # [T, C]
+            full_train = np.asarray(full_train, dtype=np.float64)
+            cos_sim = cosine_similarity(full_train.T)     # [C, C]
             cos_sim = np.maximum(cos_sim, 0)
 
             K = getattr(self, 'k_hypergraph', 3)
@@ -125,7 +125,7 @@ class MADMSolver:
             return ei.to(self.device), ef.to(self.device)
 
         except Exception as e:
-            print(f"Warning: hypergraph construction failed ({e}), falling back to full graph.")
+            print(f"警告：超图构建失败（{e}），使用全连接回退方案。")
             C = self.input_c
             idx = torch.arange(C)
             ei = torch.stack([idx.repeat_interleave(C), idx.repeat(C)])
@@ -133,10 +133,10 @@ class MADMSolver:
             return ei.to(self.device), ef.to(self.device)
 
     # ----------------------------------------------------------
-    #  Model construction
+    #  模型构建
     # ----------------------------------------------------------
     def _build_model(self):
-        self.model = MADM(
+        self.model = HADM(
             win_size   = self.win_size,
             enc_in     = self.input_c,
             c_out      = self.input_c,
@@ -155,10 +155,10 @@ class MADMSolver:
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.lr)
         n = sum(p.numel() for p in self.model.parameters())
-        print(f"MADM built: {n/1e6:.2f}M parameters, device: {self.device}")
+        print(f"HADM 构建完成：{n/1e6:.2f}M 参数，设备：{self.device}")
 
     def _update_hypergraph(self):
-        """Rebuild hypergraph and update model buffers."""
+        """重新构建超图并更新模型缓冲区。"""
         self.hyperedge_index, self.edge_features = self._build_hypergraph()
         rb = self.model.relational_branch
         rb.hyperedge_index = self.hyperedge_index
@@ -166,7 +166,7 @@ class MADMSolver:
         rb._build_relational_prior()
 
     # ----------------------------------------------------------
-    #  Validation
+    #  验证
     # ----------------------------------------------------------
     def _vali(self, loader):
         self.model.eval()
@@ -190,11 +190,11 @@ class MADMSolver:
         return float(np.mean(losses))
 
     # ----------------------------------------------------------
-    #  Training
+    #  训练
     # ----------------------------------------------------------
     def train(self):
         print("=" * 50)
-        print(f"MADM training | dataset: {self.dataset}")
+        print(f"HADM 训练开始  |  数据集：{self.dataset}")
         print("=" * 50)
 
         os.makedirs(self.model_save_path, exist_ok=True)
@@ -218,10 +218,10 @@ class MADMSolver:
 
                 out, sl, pl, _, _, rel_disc, rel_attn = self.model(inp)
 
-                # Reconstruction loss
+                # 重建损失
                 rec_loss = self.criterion(out, inp)
 
-                # Temporal association discrepancy
+                # 时间关联差异
                 s_loss = p_loss = 0.0
                 for u in range(len(pl)):
                     pn = pl[u] / pl[u].sum(-1, keepdim=True)
@@ -231,7 +231,7 @@ class MADMSolver:
                                + torch.mean(my_kl_loss(sl[u].detach(), pn)))
                 s_loss /= len(pl); p_loss /= len(pl)
 
-                # Spatial association discrepancy (stop-gradient on P_S in Phase 1)
+                # 关系关联差异（Phase 1 使用梯度分离）
                 if rel_attn is not None and rel_attn.numel() > 0:
                     rel_loss = self.model.relational_branch \
                         .compute_relational_discrepancy(
@@ -244,11 +244,11 @@ class MADMSolver:
                     rel_loss = torch.zeros(1, device=self.device)
 
                 if step % 2 == 0:
-                    # Phase 1: amplify both association discrepancies
+                    # Phase 1：放大两个关联差异
                     loss = rec_loss - k * s_loss - lr * rel_loss
                     l1_buf.append(loss.item())
                 else:
-                    # Phase 2: update temporal prior bandwidth sigma only
+                    # Phase 2：仅更新时间先验的带宽 σ
                     loss = rec_loss + k * p_loss
                     l2_buf.append(loss.item())
 
@@ -265,10 +265,11 @@ class MADMSolver:
 
             early_stop(val_loss, self.model, self.model_save_path)
             if early_stop.early_stop:
-                print("Early stopping triggered.")
+                print("早停触发。")
                 break
             adjust_learning_rate(self.optimizer, epoch + 1, self.lr)
 
+        # 保存训练统计
         stats = {
             'val_mean': float(np.mean(val_history)),
             'val_std':  float(np.std(val_history)),
@@ -277,10 +278,10 @@ class MADMSolver:
         with open(os.path.join(self.model_save_path,
                                f'{self.dataset}_train_stats.json'), 'w') as f:
             json.dump(stats, f, indent=2)
-        print(f"Training done | val loss mean={stats['val_mean']:.4f} +/- {stats['val_std']:.4f}")
+        print(f"训练结束  |  验证损失均值={stats['val_mean']:.4f} ± {stats['val_std']:.4f}")
 
     # ----------------------------------------------------------
-    #  Testing
+    #  测试
     # ----------------------------------------------------------
     def test(self):
         ckpt = os.path.join(self.model_save_path,
@@ -289,7 +290,7 @@ class MADMSolver:
         self.model.eval()
         self._update_hypergraph()
         print("=" * 50)
-        print(f"MADM testing | dataset: {self.dataset}")
+        print(f"HADM 测试  |  数据集：{self.dataset}")
         print("=" * 50)
 
         criterion = nn.MSELoss(reduction='none')
@@ -302,9 +303,10 @@ class MADMSolver:
                     inp = inp.float().to(self.device)
                     out, sl, pl, _, _, rel_disc, _ = self.model(inp)
 
+                    # 逐时间步重建误差
                     rec = torch.mean(criterion(inp, out), dim=-1)  # [B, L]
 
-                    # Temporal association discrepancy weighting
+                    # 时间关联差异加权
                     s_loss = p_loss = torch.zeros_like(rec)
                     for u in range(len(pl)):
                         pn = pl[u] / pl[u].sum(-1, keepdim=True)
@@ -312,7 +314,7 @@ class MADMSolver:
                         p_loss += my_kl_loss(pn, sl[u].detach()) * temperature
                     s_loss /= len(pl); p_loss /= len(pl)
 
-                    # Spatial modulation factor (1 + D_bar_S)
+                    # 关系调制因子 (1 + D̄_rel)
                     if rel_disc is not None and rel_disc.numel() > 0:
                         rel_score = rel_disc.mean(dim=-1)   # [B, L]
                     else:
@@ -324,15 +326,15 @@ class MADMSolver:
                     scores.append(score.cpu().numpy())
             return np.concatenate(scores).reshape(-1)
 
-        # Threshold calibration
+        # 阈值标定
         train_energy = compute_energy(self.train_loader)
         thre_energy  = compute_energy(self.thre_loader)
         thresh = np.percentile(
             np.concatenate([train_energy, thre_energy]),
             100 - self.anormly_ratio)
-        print(f"Threshold: {thresh:.6f}  (anomaly ratio: {self.anormly_ratio}%)")
+        print(f"阈值：{thresh:.6f}  （异常比例：{self.anormly_ratio}%）")
 
-        # Test scoring
+        # 测试评分
         test_energy = compute_energy(self.test_loader)
         test_labels = np.concatenate(
             [lb.numpy() for _, lb in self.test_loader]).reshape(-1)
@@ -340,7 +342,7 @@ class MADMSolver:
         pred = (test_energy > thresh).astype(int)
         gt   = test_labels.astype(int)
 
-        # Point Adjustment (Xu et al., ICLR 2022)
+        # Point Adjustment（Xu et al., ICLR 2022）
         anomaly_state = False
         for i in range(len(gt)):
             if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
@@ -359,9 +361,10 @@ class MADMSolver:
         acc = accuracy_score(gt, pred)
         prec, rec, f1, _ = precision_recall_fscore_support(
             gt, pred, average='binary')
-        print(f"[Results] Acc={acc:.4f} | Prec={prec:.4f} | "
+        print(f"[结果] Acc={acc:.4f} | Prec={prec:.4f} | "
               f"Rec={rec:.4f} | F1={f1:.4f}")
 
+        # 保存结果
         np.save(os.path.join(self.model_save_path,
                              f'{self.dataset}_pred.npy'), pred)
         np.save(os.path.join(self.model_save_path,
