@@ -20,7 +20,7 @@ from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from sklearn.metrics.pairwise import cosine_similarity
 
 from data_factory.data_loader import get_loader_segment
-from model.hadm import HADM
+from model.madm import MADM
 
 
 # ============================================================
@@ -103,7 +103,11 @@ class HADMSolver:
     #  超图构建
     # ----------------------------------------------------------
     def _build_hypergraph(self):
-        """基于全量训练数据的余弦相似度构建 Top-K 超图。"""
+        """基于全量训练数据的余弦相似度构建 Top-K 邻居邻域。
+
+        仅在初始化时计算一次，边与先验关联注册为不可学习 buffer，
+        训练与推理全程保持固定；不使用任何测试数据重建或刷新拓扑。
+        """
         try:
             # 使用全量训练数据（所有时间步）计算传感器间余弦相似度
             full_train = self.train_loader.dataset.train  # [T, C]
@@ -136,7 +140,7 @@ class HADMSolver:
     #  模型构建
     # ----------------------------------------------------------
     def _build_model(self):
-        self.model = HADM(
+        self.model = MADM(
             win_size   = self.win_size,
             enc_in     = self.input_c,
             c_out      = self.input_c,
@@ -156,14 +160,6 @@ class HADMSolver:
             self.model.parameters(), lr=self.lr)
         n = sum(p.numel() for p in self.model.parameters())
         print(f"HADM 构建完成：{n/1e6:.2f}M 参数，设备：{self.device}")
-
-    def _update_hypergraph(self):
-        """重新构建超图并更新模型缓冲区。"""
-        self.hyperedge_index, self.edge_features = self._build_hypergraph()
-        rb = self.model.relational_branch
-        rb.hyperedge_index = self.hyperedge_index
-        rb.edge_features   = self.edge_features
-        rb._build_relational_prior()
 
     # ----------------------------------------------------------
     #  验证
@@ -210,7 +206,6 @@ class HADMSolver:
             t0 = time.time()
             l1_buf, l2_buf = [], []
             self.model.train()
-            self._update_hypergraph()
 
             for step, (input_data, _) in enumerate(self.train_loader):
                 self.optimizer.zero_grad()
@@ -288,7 +283,6 @@ class HADMSolver:
                             f'{self.dataset}_checkpoint.pth')
         self.model.load_state_dict(torch.load(ckpt, map_location=self.device))
         self.model.eval()
-        self._update_hypergraph()
         print("=" * 50)
         print(f"HADM 测试  |  数据集：{self.dataset}")
         print("=" * 50)
